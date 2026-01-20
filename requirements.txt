@@ -1,0 +1,8 @@
+fastapi 
+uvicorn
+groq 
+rank_bm25 
+pandas 
+numpy 
+python-dateutil
+python-dotenv
