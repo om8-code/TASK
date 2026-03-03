@@ -23,6 +23,10 @@ It includes:
   contains the generated answer, the list of source documents that were fed to
   the model and an optional ``message`` field that explains why no answer could
   be produced.
+* **CodeReviewRequest** – a new model that accepts raw source code (and an
+  optional language hint) for automated review.
+* **CodeReviewResponse** – a new model that returns a rating, pros, cons,
+  suggestions, and an optional alternative technology recommendation.
 
 All models are deliberately simple, type‑annotated and include helpful
 validation where appropriate.  They are ready for production use and can be
@@ -78,94 +82,148 @@ class Document(BaseModel):
     Attributes
     ----------
     id: str
-        Unique identifier – typically the row index or a composite key.
+        Unique identifier – typically the original CSV row index.
     text: str
-        The plain‑text representation of the row.
-    source: Optional[str]
-        Human‑readable source name (e.g., the CSV filename) – useful for the
-        client to display where the information originated.
+        Plain‑text representation of the row, suitable for BM25 indexing.
     """
 
-    id: str = Field(..., description="Unique identifier for the document")
-    text: str = Field(..., description="Full text content of the document")
-    source: Optional[str] = Field(
-        default=None, description="Optional source label (e.g., filename)"
-    )
+    id: str = Field(..., description="Unique document identifier")
+    text: str = Field(..., description="Plain‑text content of the document")
 
     class Config:
         orm_mode = True
 
 
 class QueryRequest(BaseModel):
-    """Payload for the search endpoint.
+    """Payload for the ``/search`` endpoint.
 
-    ``top_k`` is optional; when omitted the global default from ``Settings``
-    will be used by the service implementation.
+    The ``top_k`` field overrides the global default defined in ``Settings``.
     """
 
-    query: str = Field(..., min_length=1, description="User query string")
+    query: str = Field(..., min_length=1, description="User search query")
     top_k: Optional[int] = Field(
-        default=None,
+        None,
         ge=1,
         le=100,
-        description="Number of documents to retrieve (overrides global default)",
+        description="Number of documents to retrieve; falls back to Settings.top_k",
     )
 
-    @validator("query")
-    def _strip_query(cls, v: str) -> str:
-        return v.strip()
+    @validator("top_k")
+    def _positive_top_k(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError("top_k must be at least 1")
+        return v
 
 
 class RetrievalResponse(BaseModel):
-    """Response model for the ``/search`` endpoint.
+    """Response model for the ``/search`` endpoint."""
 
-    It echoes the original query and returns the list of most relevant
-    ``Document`` objects.
-    """
-
-    query: str = Field(..., description="The query that was processed")
-    documents: List[Document] = Field(
-        ..., description="List of documents ordered by relevance"
-    )
+    query: str = Field(..., description="The original user query")
+    results: List[Document] = Field(..., description="List of retrieved documents")
 
     class Config:
         orm_mode = True
 
 
 class AnswerRequest(QueryRequest):
-    """Payload for the optional LLM‑augmented answer endpoint.
+    """Payload for the optional ``/answer`` endpoint.
 
-    Inherits all fields from :class:`QueryRequest`.  Keeping a separate subclass
-    makes the OpenAPI schema clearer and leaves room for future LLM‑specific
-    parameters (e.g., temperature, model name).
+    Inherits from ``QueryRequest`` to keep the API surface consistent while
+    allowing future extensions specific to LLM‑driven answering.
     """
 
+    # No additional fields for now – placeholder for future use.
     pass
 
 
 class AnswerResponse(BaseModel):
-    """Response model when an LLM is used to generate an answer.
+    """Response model for the LLM‑augmented endpoint.
+
+    If the LLM cannot produce a confident answer, ``answer`` may be ``None`` and
+    ``message`` will contain an explanatory note.
+    """
+
+    answer: Optional[str] = Field(
+        None, description="Generated answer text, if available"
+    )
+    sources: List[Document] = Field(
+        ..., description="Documents that were supplied to the LLM as context"
+    )
+    message: Optional[str] = Field(
+        None,
+        description="Human‑readable explanation when no answer could be generated",
+    )
+
+    class Config:
+        orm_mode = True
+
+
+# ---------------------------------------------------------------------------
+# New models for automated code review functionality
+# ---------------------------------------------------------------------------
+
+class CodeReviewRequest(BaseModel):
+    """Request model for submitting source code to be reviewed.
 
     Attributes
     ----------
-    answer: str
-        The text generated by the LLM.  If the model could not find a grounded
-        answer, a predefined fallback message is returned.
-    sources: List[Document]
-        Documents that were supplied to the LLM as context.
-    message: Optional[str]
-        Additional information for the client – for example, a warning that the
-        answer is based on limited data.
+    code: str
+        The raw source code that should be analysed.
+    language: str, optional
+        Programming language hint (e.g., ``"python"``).  Defaults to ``"python"``
+        because the repository primarily contains Python code.
     """
 
-    answer: str = Field(..., description="Answer generated by the LLM")
-    sources: List[Document] = Field(
-        ..., description="Documents that were used as context for the answer"
+    code: str = Field(..., min_length=1, description="Source code to review")
+    language: str = Field(
+        "python",
+        description="Programming language of the supplied code; defaults to Python",
     )
-    message: Optional[str] = Field(
-        default=None,
-        description="Optional explanatory message (e.g., fallback notice)",
+
+    @validator("code")
+    def _non_empty_code(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("code must contain non‑whitespace characters")
+        return v
+
+
+class CodeReviewResponse(BaseModel):
+    """Response model containing a structured review of submitted code.
+
+    The service evaluates the code and returns:
+
+    * ``rating`` – an integer from 1 (poor) to 5 (excellent).
+    * ``pros`` – a list of positive aspects.
+    * ``cons`` – a list of drawbacks or potential issues.
+    * ``suggestions`` – actionable recommendations for improvement.
+    * ``alternative_technology`` – optional suggestion of a different tech
+      stack or library that could better solve the problem.
+    """
+
+    rating: int = Field(
+        ..., ge=1, le=5, description="Overall quality rating on a 1‑5 scale"
     )
+    pros: List[str] = Field(..., description="Positive aspects of the code")
+    cons: List[str] = Field(..., description="Negative aspects or risks")
+    suggestions: List[str] = Field(
+        ..., description="Actionable improvement recommendations"
+    )
+    alternative_technology: Optional[str] = Field(
+        None,
+        description="Suggested alternative technology, library, or framework",
+    )
+
+    @validator("pros", "cons", "suggestions", each_item=True)
+    def _non_empty_strings(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("list items must be non‑empty strings")
+        return v.strip()
+
+    @validator("rating")
+    def _rating_range(cls, v: int) -> int:
+        if not (1 <= v <= 5):
+            raise ValueError("rating must be between 1 and 5")
+        return v
 
     class Config:
         orm_mode = True
@@ -178,4 +236,6 @@ __all__ = [
     "RetrievalResponse",
     "AnswerRequest",
     "AnswerResponse",
+    "CodeReviewRequest",
+    "CodeReviewResponse",
 ]
